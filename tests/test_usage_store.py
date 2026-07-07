@@ -193,11 +193,13 @@ class TestBackoff:
         assert usage_store._failure_backoff_s(5, 10.0) == pytest.approx(480.0)
         assert BACKOFF_BASE_S * 2**4 == 480.0
 
-    def test_edge_429_backoff_capped(self, store, clock):
+    def test_edge_429_backoff_fast_then_ramps(self, store, clock):
         # "Retry-After: 0" is the sustained/edge rule: retries are penalty-free
-        # and ~every other one succeeds, so backoff must stay tight instead of
-        # doubling to BACKOFF_CAP_S — freshness matters most during heavy burn.
-        expected = [30.0, 60.0, 120.0, 120.0, 120.0]
+        # and ~every other one succeeds. The first EDGE_FAST_RETRIES misses stay
+        # at EDGE_BACKOFF_FAST_S (fast recovery of the display, incl. the active
+        # account), then the wait ramps up toward EDGE_BACKOFF_CAP_S so a
+        # genuinely saturated account isn't hammered every 15s forever.
+        expected = [15.0, 15.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0, 90.0]
         for i, want in enumerate(expected):
             store.record(
                 {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
@@ -206,6 +208,13 @@ class TestBackoff:
             assert entry.consecutive_failures == i + 1
             assert entry.backoff_until == pytest.approx(clock.now + want)
             clock.advance(want + 1)
+
+    def test_edge_backoff_first_miss_is_fast(self):
+        # The property that fixes the ~10-min active-account freeze: one edge
+        # miss recovers in seconds, not a minute-plus.
+        assert usage_store._failure_backoff_s(
+            1, 0.0
+        ) == usage_store.EDGE_BACKOFF_FAST_S
 
     def test_retry_after_floor_is_capped(self):
         # A pathological Retry-After can never park an account for hours.

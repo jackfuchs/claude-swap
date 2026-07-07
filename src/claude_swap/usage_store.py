@@ -58,14 +58,21 @@ BACKOFF_CAP_S = 600.0
 # Retry-After value:
 # - "Retry-After: 0" = the sustained/edge rule: the account's overall Claude
 #   Code activity has its budget at the edge; retries are penalty-free and
-#   ~every other one succeeds. Long exponential backoff only costs freshness
-#   during exactly the heavy-burn periods where it matters most, so edge
-#   backoff is capped low.
+#   ~every other one succeeds. So the first few retries stay very short
+#   (EDGE_BACKOFF_FAST_S) to keep the display fresh during exactly the
+#   heavy-burn periods where it matters most; only after EDGE_FAST_RETRIES
+#   consecutive misses — the account is genuinely saturated, not just busy —
+#   does the wait ramp up (toward EDGE_BACKOFF_CAP_S) so we stop hammering a
+#   limit that clearly isn't clearing. This ramp also throttles the active
+#   account, which is polled every pass and would otherwise poll straight into
+#   the wall.
 # - "Retry-After: N>0" = the burst rule (~5 rapid requests on one account →
 #   hard 300s block; measured: accurate, counts down, not extended by
 #   probing). Honored as the wait, up to a safety cap so a pathological
 #   header can never park an account for hours.
-EDGE_BACKOFF_CAP_S = 120.0
+EDGE_BACKOFF_FAST_S = 15.0   # the short retry cadence for the first edge misses
+EDGE_FAST_RETRIES = 3        # this many fast retries before the wait ramps up
+EDGE_BACKOFF_CAP_S = 90.0    # ceiling once a saturated account keeps refusing
 RETRY_AFTER_FLOOR_CAP_S = 900.0
 
 # (email, organizationUuid) — the identity a slot number currently maps to.
@@ -191,8 +198,14 @@ def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -
     if retry_after_s is None:
         return computed
     if retry_after_s == 0:
-        # Edge rule: retrying is penalty-free, so keep the cadence tight.
-        return min(computed, EDGE_BACKOFF_CAP_S)
+        # Edge rule: retries are penalty-free and ~half succeed. Keep the first
+        # few very short so the display recovers in seconds, then ramp up once
+        # the account is clearly saturated so we neither hammer a stuck limit
+        # nor let the active account poll into the wall every pass.
+        if consecutive_failures <= EDGE_FAST_RETRIES:
+            return EDGE_BACKOFF_FAST_S
+        steps = consecutive_failures - EDGE_FAST_RETRIES + 1
+        return min(EDGE_BACKOFF_FAST_S * steps, EDGE_BACKOFF_CAP_S)
     # Burst rule: wait at least what the server asked (up to the safety cap);
     # our own curve may wait longer.
     return max(min(retry_after_s, RETRY_AFTER_FLOOR_CAP_S), computed)
